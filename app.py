@@ -9,17 +9,16 @@ import json
 import re
 import time
 from typing import Any, Iterable
-from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from flask import Flask, jsonify, render_template_string, request
 
 ROOT_URL = "https://schedule.siriusuniversity.ru/"
 GROUP_PAGE_URL = ROOT_URL
 CLASSROOM_PAGE_URL = f"{ROOT_URL}classroom"
-LIVEWIRE_ENDPOINT = "https://schedule.siriusuniversity.ru/livewire/message/main-grid"
-ERALAS_API_URL = "https://eralas.ru/api"
+GROUP_LIVEWIRE_ENDPOINT = "https://schedule.siriusuniversity.ru/livewire/message/main-grid"
+CLASSROOM_LIVEWIRE_ENDPOINT = "https://schedule.siriusuniversity.ru/livewire/message/classroom.classroom-main-grid"
 SOURCE_TIMEOUT = 8
 CACHE_TTL_SECONDS = 600
 DEFAULT_DAY_START = "08:00"
@@ -35,8 +34,26 @@ LESSON_SLOTS = (
     ("18:15", "19:35"),
     ("19:50", "21:10"),
 )
-_eralas_groups_cache: tuple[float, list[str]] | None = None
-_eralas_schedules_cache: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
+_classrooms_cache: tuple[float, list[str]] | None = None
+_classroom_schedules_cache: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
+CLASSROOM_SEARCH_TERMS = (
+    "",
+    "К_",
+    "1.",
+    "1,",
+    "2.",
+    "3.",
+    "Аль",
+    "Альфа",
+    "Бета",
+    "Гамма",
+    "Дельта",
+    "ЛК",
+    "Газ",
+    "Рос",
+    "Лаб",
+    "дистан",
+)
 
 
 @dataclass
@@ -112,7 +129,7 @@ class SiriusScheduleClient:
 
     def _post_livewire(self, payload: dict[str, Any]) -> dict[str, Any]:
         req = Request(
-            LIVEWIRE_ENDPOINT,
+            GROUP_LIVEWIRE_ENDPOINT,
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
@@ -224,40 +241,111 @@ class SiriusScheduleClient:
             return datetime.min
 
 
-class EralasScheduleClient:
-    def fetch_groups(self) -> list[str]:
-        payload = self._get_json("/groups")
-        if not isinstance(payload, list):
-            raise RuntimeError("Groups API returned unexpected payload")
-        return sorted(str(item).strip() for item in payload if str(item).strip())
+class OfficialClassroomClient:
+    def __init__(self) -> None:
+        cookie_jar = CookieJar()
+        self._opener = build_opener(HTTPCookieProcessor(cookie_jar))
 
-    def fetch_schedule(self, group: str, week_offset: int) -> dict[str, Any]:
-        payload = self._get_json("/schedule", {"group": group, "week": str(week_offset)})
-        if not isinstance(payload, list):
-            raise RuntimeError("Schedule API returned unexpected payload")
-        return self._normalize_response(group, week_offset, payload)
-
-    def _get_json(self, path: str, params: dict[str, str] | None = None) -> Any:
-        query = f"?{urlencode(params)}" if params else ""
-        url = f"{ERALAS_API_URL}{path}{query}"
-        req = Request(
-            url,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "ScheduleAuditory/1.0",
-            },
+    def search_classrooms(self, search: str) -> list[str]:
+        state = self._get_initial_state()
+        response = self._post_livewire(
+            state,
+            [
+                {
+                    "type": "syncInput",
+                    "payload": {
+                        "id": state.fingerprint["id"],
+                        "name": "search",
+                        "value": search,
+                    },
+                }
+            ],
         )
-        with urlopen(req, timeout=SOURCE_TIMEOUT) as response:
+        data = response.get("serverMemo", {}).get("data", {})
+        return self._normalize_classroom_list(data.get("classroomsList"))
+
+    def fetch_schedule(self, classroom: str, week_offset: int) -> dict[str, Any]:
+        state = self._get_initial_state()
+        updates = self._build_updates(state.fingerprint["id"], classroom, week_offset)
+        response = self._post_livewire(state, updates)
+        data = response.get("serverMemo", {}).get("data", {})
+        return self._normalize_response(classroom, week_offset, data)
+
+    def _get_initial_state(self) -> LivewireState:
+        with self._opener.open(CLASSROOM_PAGE_URL, timeout=SOURCE_TIMEOUT) as response:
+            page_html = response.read().decode("utf-8")
+
+        state_match = re.search(r'wire:initial-data="([^"]+)"', page_html)
+        if state_match is None:
+            raise RuntimeError("Cannot find classroom Livewire initial state")
+
+        token_match = re.search(r"window\.livewire_token = '([^']+)';", page_html)
+        if token_match is None:
+            raise RuntimeError("Cannot find Livewire token")
+
+        state = json.loads(html.unescape(state_match.group(1)))
+        return LivewireState(
+            token=token_match.group(1),
+            fingerprint=state["fingerprint"],
+            server_memo=state["serverMemo"],
+        )
+
+    def _build_updates(self, component_id: str, classroom: str, week_offset: int) -> list[dict[str, Any]]:
+        updates: list[dict[str, Any]] = [
+            {
+                "type": "callMethod",
+                "payload": {
+                    "id": component_id,
+                    "method": "set",
+                    "params": [classroom],
+                },
+            }
+        ]
+
+        for _ in range(week_offset):
+            updates.append(
+                {
+                    "type": "callMethod",
+                    "payload": {
+                        "id": component_id,
+                        "method": "addWeek",
+                        "params": [],
+                    },
+                }
+            )
+
+        return updates
+
+    def _post_livewire(self, state: LivewireState, updates: list[dict[str, Any]]) -> dict[str, Any]:
+        req = Request(
+            CLASSROOM_LIVEWIRE_ENDPOINT,
+            data=json.dumps(
+                {
+                    "_token": state.token,
+                    "fingerprint": state.fingerprint,
+                    "serverMemo": state.server_memo,
+                    "updates": updates,
+                }
+            ).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/plain, */*",
+                "X-Livewire": "true",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": CLASSROOM_PAGE_URL,
+            },
+            method="POST",
+        )
+
+        with self._opener.open(req, timeout=SOURCE_TIMEOUT) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    def _normalize_response(self, requested_group: str, week_offset: int, events: list[Any]) -> dict[str, Any]:
+    def _normalize_response(self, requested_classroom: str, week_offset: int, data: dict[str, Any]) -> dict[str, Any]:
+        raw_events = self._flatten_events(data.get("events"))
         grouped: dict[str, dict[str, Any]] = {}
 
-        for raw_event in events:
-            if not isinstance(raw_event, dict):
-                continue
-
-            date = raw_event.get("date")
+        for event in raw_events:
+            date = event.get("date")
             if not isinstance(date, str) or not date.strip():
                 continue
 
@@ -265,11 +353,11 @@ class EralasScheduleClient:
                 date,
                 {
                     "date": date,
-                    "day_week": raw_event.get("dayWeek"),
+                    "day_week": event.get("dayWeek"),
                     "events": [],
                 },
             )
-            day_bucket["events"].append(self._normalize_event(raw_event))
+            day_bucket["events"].append(self._normalize_event(event, data.get("classroom") or requested_classroom))
 
         days = sorted(grouped.values(), key=lambda item: SiriusScheduleClient._parse_date(item.get("date")))
         for day in days:
@@ -281,17 +369,17 @@ class EralasScheduleClient:
             )
 
         return {
-            "source": "eralas.ru",
-            "group": requested_group,
+            "source": "schedule.siriusuniversity.ru",
+            "classroom": data.get("classroom") or requested_classroom,
             "week_offset": week_offset,
-            "week_number": None,
-            "week_start_date": None,
-            "month": None,
-            "events_total": len(events),
+            "week_number": data.get("numWeek"),
+            "week_start_date": data.get("date"),
+            "month": data.get("month"),
+            "events_total": data.get("count", len(raw_events)),
             "days": days,
         }
 
-    def _normalize_event(self, event: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_event(self, event: dict[str, Any], fallback_classroom: Any) -> dict[str, Any]:
         number_pair = self._safe_int(event.get("numberPair"))
         start_time = event.get("startTime")
         end_time = event.get("endTime")
@@ -305,10 +393,6 @@ class EralasScheduleClient:
         else:
             teacher_list = []
 
-        teacher_details = event.get("teacherDetails")
-        if isinstance(teacher_details, dict) and teacher_details not in teacher_list:
-            teacher_list.append(teacher_details)
-
         return {
             "start_time": start_time,
             "end_time": end_time,
@@ -316,7 +400,7 @@ class EralasScheduleClient:
             "discipline": event.get("discipline"),
             "group_type": event.get("groupType"),
             "address": event.get("address"),
-            "classroom": event.get("classroom"),
+            "classroom": event.get("classroom") or fallback_classroom,
             "comment": event.get("comment"),
             "place": event.get("place"),
             "url_online": event.get("urlOnline"),
@@ -325,6 +409,43 @@ class EralasScheduleClient:
             "color": event.get("color"),
             "teachers": teacher_list,
         }
+
+    @staticmethod
+    def _flatten_events(events: Any) -> list[dict[str, Any]]:
+        if isinstance(events, dict):
+            event_lists = events.values()
+        elif isinstance(events, list):
+            event_lists = [events]
+        else:
+            event_lists = []
+
+        result: list[dict[str, Any]] = []
+        for event_list in event_lists:
+            if not isinstance(event_list, list):
+                continue
+            for event in event_list:
+                if isinstance(event, dict):
+                    result.append(event)
+        return result
+
+    @staticmethod
+    def _normalize_classroom_list(value: Any) -> list[str]:
+        if isinstance(value, dict):
+            raw_items = value.values()
+        elif isinstance(value, list):
+            raw_items = value
+        else:
+            raw_items = []
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            classroom = " ".join(str(item).split())
+            key = normalize_lookup(classroom)
+            if classroom and key not in seen:
+                result.append(classroom)
+                seen.add(key)
+        return result
 
     @staticmethod
     def _safe_int(value: Any) -> int:
@@ -363,7 +484,11 @@ def classroom_matches(actual: Any, requested: str) -> bool:
     requested_normalized = normalize_lookup(requested)
     if not actual_normalized or not requested_normalized:
         return False
-    return actual_normalized == requested_normalized or requested_normalized in actual_normalized
+    return (
+        actual_normalized == requested_normalized
+        or requested_normalized in actual_normalized
+        or actual_normalized in requested_normalized
+    )
 
 
 def parse_client_date(value: str) -> str:
@@ -523,52 +648,78 @@ def fetch_schedules_parallel(
     return payloads, errors
 
 
-def cached_eralas_groups() -> list[str]:
-    global _eralas_groups_cache
+def cached_classrooms() -> list[str]:
+    global _classrooms_cache
 
     now = time.monotonic()
-    if _eralas_groups_cache and now - _eralas_groups_cache[0] < CACHE_TTL_SECONDS:
-        return _eralas_groups_cache[1]
+    if _classrooms_cache and now - _classrooms_cache[0] < CACHE_TTL_SECONDS:
+        return _classrooms_cache[1]
 
-    groups = EralasScheduleClient().fetch_groups()
-    _eralas_groups_cache = (now, groups)
-    return groups
+    client = OfficialClassroomClient()
+    classrooms_by_key: dict[str, str] = {}
+    for term in CLASSROOM_SEARCH_TERMS:
+        for classroom in client.search_classrooms(term):
+            classrooms_by_key.setdefault(normalize_lookup(classroom), classroom)
+
+    classrooms = sorted(classrooms_by_key.values(), key=classroom_sort_key)
+    _classrooms_cache = (now, classrooms)
+    return classrooms
 
 
-def cached_eralas_schedule(group: str, week: int) -> dict[str, Any]:
-    key = (group, week)
+def resolve_requested_classrooms(requested_classrooms: list[str], known_classrooms: list[str]) -> list[str]:
+    if not requested_classrooms:
+        return known_classrooms
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for requested in requested_classrooms:
+        matches = [classroom for classroom in known_classrooms if classroom_matches(classroom, requested)]
+        if not matches:
+            matches = [requested]
+
+        for classroom in matches:
+            key = normalize_lookup(classroom)
+            if key not in seen:
+                resolved.append(classroom)
+                seen.add(key)
+
+    return resolved
+
+
+def cached_classroom_schedule(classroom: str, week: int) -> dict[str, Any]:
+    key = (classroom, week)
     now = time.monotonic()
-    cached = _eralas_schedules_cache.get(key)
+    cached = _classroom_schedules_cache.get(key)
     if cached and now - cached[0] < CACHE_TTL_SECONDS:
         return cached[1]
 
-    payload = EralasScheduleClient().fetch_schedule(group, week)
-    _eralas_schedules_cache[key] = (now, payload)
+    payload = OfficialClassroomClient().fetch_schedule(classroom, week)
+    _classroom_schedules_cache[key] = (now, payload)
     return payload
 
 
-def fetch_eralas_schedules_parallel(
-    groups: list[str],
+def fetch_classroom_schedules_parallel(
+    classrooms: list[str],
     week: int,
 ) -> tuple[list[tuple[str, dict[str, Any]]], list[dict[str, str]]]:
-    if not groups:
+    if not classrooms:
         return [], []
 
     payloads: list[tuple[str, dict[str, Any]]] = []
     errors: list[dict[str, str]] = []
-    max_workers = min(len(groups), 12)
+    max_workers = min(len(classrooms), 12)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_by_group = {
-            executor.submit(cached_eralas_schedule, group, week): group
-            for group in groups
+        future_by_classroom = {
+            executor.submit(cached_classroom_schedule, classroom, week): classroom
+            for classroom in classrooms
         }
-        for future in as_completed(future_by_group):
-            group = future_by_group[future]
+        for future in as_completed(future_by_classroom):
+            classroom = future_by_classroom[future]
             try:
-                payloads.append((group, future.result()))
+                payloads.append((classroom, future.result()))
             except Exception as error:
-                errors.append({"source": group, "reason": str(error)})
+                errors.append({"source": classroom, "reason": str(error)})
 
     return payloads, errors
 
@@ -626,9 +777,10 @@ def index() -> str:
 
 @app.get("/api/schedule")
 def get_schedule() -> Any:
+    classroom = request.args.get("classroom", request.args.get("room", "")).strip()
     group = request.args.get("group", "").strip()
-    if not group:
-        return jsonify({"error": "Query parameter 'group' is required"}), 400
+    if not classroom and not group:
+        return jsonify({"error": "Query parameter 'classroom' or 'group' is required"}), 400
 
     week_raw = request.args.get("week", "0").strip()
     try:
@@ -640,8 +792,10 @@ def get_schedule() -> Any:
         return jsonify({"error": "Query parameter 'week' must be >= 0"}), 400
 
     try:
-        client = EralasScheduleClient()
-        payload = client.fetch_schedule(group, week)
+        if classroom:
+            payload = OfficialClassroomClient().fetch_schedule(classroom, week)
+        else:
+            payload = SiriusScheduleClient().fetch_schedule(group, week)
         return jsonify(payload)
     except HTTPError as error:
         return (
@@ -677,51 +831,39 @@ def get_free_classrooms() -> Any:
 
     week = int(request.args.get("week", "0"))
     requested_classrooms = classrooms
-    busy_by_room: dict[str, list[dict[str, Any]]] = {room: [] for room in requested_classrooms}
-    known_rooms: dict[str, str] = {normalize_lookup(room): room for room in requested_classrooms}
+    busy_by_room: dict[str, list[dict[str, Any]]] = {}
     errors: list[dict[str, str]] = []
+    failed_rooms: set[str] = set()
     checked_sources: list[str] = []
     week_info: dict[str, Any] = {}
 
     if mode == "rooms":
         try:
-            groups_to_scan = cached_eralas_groups()
+            known_classrooms = cached_classrooms()
         except Exception as error:
-            return jsonify({"error": "Failed to load group list", "reason": str(error)}), 502
+            return jsonify({"error": "Failed to load classroom list", "reason": str(error)}), 502
 
-        payloads, fetch_errors = fetch_eralas_schedules_parallel(groups_to_scan, week)
+        rooms_to_check = resolve_requested_classrooms(requested_classrooms, known_classrooms)
+        busy_by_room = {room: [] for room in rooms_to_check}
+        payloads, fetch_errors = fetch_classroom_schedules_parallel(rooms_to_check, week)
         errors.extend(fetch_errors)
+        failed_rooms.update(error["source"] for error in fetch_errors)
 
-        for group, payload in payloads:
-            checked_sources.append(group)
+        for room, payload in payloads:
+            checked_sources.append(room)
             if not week_info:
                 week_info = {
                     "week_number": payload.get("week_number"),
                     "week_start_date": payload.get("week_start_date"),
                     "month": payload.get("month"),
                 }
-            for event in events_for_date(payload.get("days", []), target_date):
-                if not isinstance(event, dict):
-                    continue
-
-                classroom = event.get("classroom")
-                if not isinstance(classroom, str) or not classroom.strip():
-                    continue
-
-                clean_room = " ".join(classroom.split())
-                if requested_classrooms:
-                    matched_rooms = [room for room in requested_classrooms if classroom_matches(clean_room, room)]
-                else:
-                    matched_rooms = [clean_room]
-
-                for room in matched_rooms:
-                    known_rooms.setdefault(normalize_lookup(room), room)
-                    busy_by_room.setdefault(room, [])
-                    if event_overlaps(event, start_minutes, end_minutes):
-                        busy_by_room[room].append(build_busy_entry(event, group))
+            busy_by_room[room].extend(
+                find_room_busy_entries(payload, room, target_date, start_minutes, end_minutes)
+            )
 
     if mode == "groups":
-        payloads, fetch_errors = fetch_eralas_schedules_parallel(groups, week)
+        busy_by_room = {room: [] for room in requested_classrooms}
+        payloads, fetch_errors = fetch_schedules_parallel(groups, week, GROUP_PAGE_URL)
         errors.extend(fetch_errors)
 
         for group, payload in payloads:
@@ -747,24 +889,28 @@ def get_free_classrooms() -> Any:
                     matched_rooms = [clean_room]
 
                 for room in matched_rooms:
-                    known_rooms.setdefault(normalize_lookup(room), room)
                     busy_by_room.setdefault(room, [])
                     if event_overlaps(event, start_minutes, end_minutes):
                         busy_by_room[room].append(build_busy_entry(event, group))
 
     rooms_payload: list[dict[str, Any]] = []
     error_by_room = {error["source"]: error["reason"] for error in errors}
-    rooms = requested_classrooms or sorted(known_rooms.values(), key=classroom_sort_key)
+    rooms = sorted(busy_by_room.keys(), key=classroom_sort_key)
     for room in rooms:
         busy_entries = sorted(
             busy_by_room.get(room, []),
             key=lambda item: (item.get("start_time") or "", item.get("discipline") or ""),
         )
 
+        if room in failed_rooms:
+            status = "error"
+        else:
+            status = "busy" if busy_entries else "free"
+
         rooms_payload.append(
             {
                 "classroom": room,
-                "status": "busy" if busy_entries else "free",
+                "status": status,
                 "busy": busy_entries,
                 "error": error_by_room.get(room),
             }
@@ -772,7 +918,7 @@ def get_free_classrooms() -> Any:
 
     return jsonify(
         {
-            "source": "eralas.ru",
+            "source": "schedule.siriusuniversity.ru",
             "mode": mode,
             "date": target_date,
             "start_time": start_time,
@@ -785,7 +931,7 @@ def get_free_classrooms() -> Any:
                 "total": len(rooms_payload),
                 "free": sum(1 for room in rooms_payload if room["status"] == "free"),
                 "busy": sum(1 for room in rooms_payload if room["status"] == "busy"),
-                "errors": len(errors),
+                "errors": sum(1 for room in rooms_payload if room["status"] == "error") or len(errors),
             },
             "rooms": rooms_payload,
         }
