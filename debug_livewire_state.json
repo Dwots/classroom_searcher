@@ -1,0 +1,80 @@
+{
+  "fingerprint": {
+    "id": "saLsGa8NxpLIaOlRCkyO",
+    "name": "main-grid",
+    "locale": "ru",
+    "path": "/",
+    "method": "GET",
+    "v": "acj"
+  },
+  "effects": {
+    "listeners": []
+  },
+  "serverMemo": {
+    "children": [],
+    "errors": [],
+    "htmlHash": "73544d23",
+    "data": {
+      "year": "2026",
+      "date": "30.04.2026",
+      "month": {
+        "number": "04",
+        "full": "Апрель",
+        "fullForDisplay": "Апреля"
+      },
+      "numWeek": 35,
+      "addNumWeek": 0,
+      "minusNumWeek": 0,
+      "count": 0,
+      "type": "grid",
+      "search": "",
+      "group": "",
+      "groupList": [],
+      "events": [],
+      "eventElement": [],
+      "watching": false,
+      "currentRouteName": "grid",
+      "statusInit": false,
+      "lectures": true,
+      "seminars": true,
+      "practices": true,
+      "laboratories": true,
+      "exams": true,
+      "other": true,
+      "width": null,
+      "height": null
+    },
+    "dataMeta": {
+      "modelCollections": {
+        "groupList": {
+          "class": "App\\Models\\Group",
+          "id": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "relations": [],
+          "connection": "mysql"
+        }
+      }
+    },
+    "checksum": "dcef3bec0547ff6a9b8378d360a6eaf08603771579d2338a7da2e920bc4a897f"
+  }
+}
