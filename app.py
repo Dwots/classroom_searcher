@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import html
 from http.cookiejar import CookieJar
 import json
@@ -34,7 +34,9 @@ LESSON_SLOTS = (
     ("18:15", "19:35"),
     ("19:50", "21:10"),
 )
+WEEKDAY_LABELS = ("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ")
 _classrooms_cache: tuple[float, list[str]] | None = None
+_groups_cache: dict[str, tuple[float, list[str]]] = {}
 _classroom_schedules_cache: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
 CLASSROOM_SEARCH_TERMS = (
     "",
@@ -81,6 +83,28 @@ class SiriusScheduleClient:
         response = self._post_livewire(payload)
         data = response.get("serverMemo", {}).get("data", {})
         return self._normalize_response(query, week_offset, data)
+
+    def search_groups(self, search: str) -> list[str]:
+        state = self._get_initial_state()
+        response = self._post_livewire(
+            payload={
+                "_token": state.token,
+                "fingerprint": state.fingerprint,
+                "serverMemo": state.server_memo,
+                "updates": [
+                    {
+                        "type": "syncInput",
+                        "payload": {
+                            "id": state.fingerprint["id"],
+                            "name": "search",
+                            "value": search,
+                        },
+                    }
+                ],
+            }
+        )
+        html_fragment = response.get("effects", {}).get("html", "")
+        return self._parse_groups_from_html(html_fragment)
 
     def _get_initial_state(self) -> LivewireState:
         with self._opener.open(self._page_url, timeout=SOURCE_TIMEOUT) as response:
@@ -239,6 +263,49 @@ class SiriusScheduleClient:
             return datetime.strptime(value, "%H:%M")
         except ValueError:
             return datetime.min
+
+    @staticmethod
+    def _normalize_group_list(value: Any) -> list[str]:
+        if isinstance(value, dict):
+            raw_items = value.values()
+        elif isinstance(value, list):
+            raw_items = value
+        else:
+            raw_items = []
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            if isinstance(item, dict):
+                group = item.get("name") or item.get("group") or item.get("title") or ""
+            else:
+                group = str(item)
+            clean_group = " ".join(group.split())
+            key = normalize_lookup(clean_group)
+            if clean_group and key not in seen:
+                result.append(clean_group)
+                seen.add(key)
+        return result
+
+    @staticmethod
+    def _parse_groups_from_html(value: Any) -> list[str]:
+        if not isinstance(value, str):
+            return []
+
+        matches = re.findall(
+            r"data-group=\"([^\"]+)\"|wire:click=\"set\('([^']+)'\)\"",
+            value,
+        )
+        result: list[str] = []
+        seen: set[str] = set()
+        for first, second in matches:
+            group = html.unescape(first or second or "")
+            clean_group = " ".join(group.split())
+            key = normalize_lookup(clean_group)
+            if clean_group and key not in seen:
+                result.append(clean_group)
+                seen.add(key)
+        return result
 
 
 class OfficialClassroomClient:
@@ -461,7 +528,7 @@ app = Flask(__name__)
 def split_values(raw: str | None) -> list[str]:
     if not raw:
         return []
-    values = re.split(r"[\n,;]+", raw)
+    values = re.split(r"[\n;]+", raw)
     result: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -530,6 +597,25 @@ def current_lesson_slot(now: datetime | None = None) -> dict[str, str]:
     return {"start": start, "end": end, "state": "finished"}
 
 
+def start_of_week(now: datetime | None = None) -> datetime:
+    current = now or datetime.now()
+    return current - timedelta(days=current.weekday())
+
+
+def week_dates(week_offset: int, now: datetime | None = None) -> list[dict[str, str]]:
+    monday = start_of_week(now) + timedelta(days=week_offset * 7)
+    result: list[dict[str, str]] = []
+    for day_offset, day_label in enumerate(WEEKDAY_LABELS):
+        current_day = monday + timedelta(days=day_offset)
+        result.append(
+            {
+                "date": current_day.strftime("%d.%m.%Y"),
+                "day_label": day_label,
+            }
+        )
+    return result
+
+
 def event_overlaps(event: dict[str, Any], start_minutes: int, end_minutes: int) -> bool:
     start_time = event.get("start_time")
     end_time = event.get("end_time")
@@ -553,7 +639,32 @@ def events_for_date(days: Iterable[dict[str, Any]], target_date: str) -> list[di
     return []
 
 
+def format_teacher_name(teacher: Any) -> str:
+    if isinstance(teacher, str):
+        return " ".join(teacher.split())
+    if not isinstance(teacher, dict):
+        return ""
+
+    fio = teacher.get("fio")
+    if isinstance(fio, str) and fio.strip():
+        return " ".join(fio.split())
+
+    parts = [
+        teacher.get("lastName"),
+        teacher.get("firstName"),
+        teacher.get("middleName"),
+    ]
+    clean_parts = [" ".join(str(part).split()) for part in parts if isinstance(part, str) and part.strip()]
+    return " ".join(clean_parts)
+
+
 def build_busy_entry(event: dict[str, Any], source: str) -> dict[str, Any]:
+    raw_teachers = event.get("teachers") or []
+    if isinstance(raw_teachers, list):
+        teachers = [name for name in (format_teacher_name(item) for item in raw_teachers) if name]
+    else:
+        teachers = []
+
     return {
         "source": source,
         "start_time": event.get("start_time"),
@@ -563,8 +674,17 @@ def build_busy_entry(event: dict[str, Any], source: str) -> dict[str, Any]:
         "group_type": event.get("group_type"),
         "classroom": event.get("classroom"),
         "address": event.get("address"),
-        "teachers": event.get("teachers") or [],
+        "teachers": teachers,
     }
+
+
+def busy_entry_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(entry.get("start_time") or ""),
+        str(entry.get("end_time") or ""),
+        str(entry.get("discipline") or ""),
+        str(entry.get("group") or ""),
+    )
 
 
 def find_room_busy_entries(
@@ -666,6 +786,18 @@ def cached_classrooms() -> list[str]:
     return classrooms
 
 
+def cached_group_search(search: str) -> list[str]:
+    key = normalize_lookup(search)
+    now = time.monotonic()
+    cached = _groups_cache.get(key)
+    if cached and now - cached[0] < CACHE_TTL_SECONDS:
+        return cached[1]
+
+    groups = SiriusScheduleClient().search_groups(search)
+    _groups_cache[key] = (now, groups)
+    return groups
+
+
 def resolve_requested_classrooms(requested_classrooms: list[str], known_classrooms: list[str]) -> list[str]:
     if not requested_classrooms:
         return known_classrooms
@@ -731,12 +863,57 @@ def classroom_sort_key(value: str) -> tuple[int, str]:
     return number, normalized
 
 
-def parse_availability_args() -> tuple[list[str], list[str], str, str, str, str, int, int]:
+def parse_interval_values(raw: str | None, fallback_start: str, fallback_end: str) -> list[dict[str, Any]]:
+    intervals: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for value in split_values(raw):
+        parts = [part.strip() for part in value.split("-", 1)]
+        if len(parts) != 2:
+            raise ValueError("Each slot must be in HH:MM-HH:MM format")
+        start_time, end_time = parts
+        start_minutes = parse_minutes(start_time)
+        end_minutes = parse_minutes(end_time)
+        if start_minutes >= end_minutes:
+            raise ValueError("Start time must be earlier than end time")
+        key = (start_time, end_time)
+        if key not in seen:
+            intervals.append(
+                {
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "start_minutes": start_minutes,
+                    "end_minutes": end_minutes,
+                }
+            )
+            seen.add(key)
+
+    if intervals:
+        return sorted(intervals, key=lambda item: (item["start_minutes"], item["end_minutes"]))
+
+    start_minutes = parse_minutes(fallback_start)
+    end_minutes = parse_minutes(fallback_end)
+    if start_minutes >= end_minutes:
+        raise ValueError("Start time must be earlier than end time")
+    return [
+        {
+            "start_time": fallback_start,
+            "end_time": fallback_end,
+            "start_minutes": start_minutes,
+            "end_minutes": end_minutes,
+        }
+    ]
+
+
+def parse_availability_args() -> tuple[list[str], list[str], str, str, int, list[dict[str, str]], list[dict[str, Any]]]:
     classrooms = split_values(request.args.get("classrooms") or request.args.get("rooms"))
     groups = split_values(request.args.get("groups"))
     mode = request.args.get("mode", "rooms").strip().casefold()
     if mode not in {"rooms", "groups"}:
         raise ValueError("Mode must be 'rooms' or 'groups'")
+    view = request.args.get("view", "day").strip().casefold()
+    if view not in {"day", "week"}:
+        raise ValueError("Query parameter 'view' must be 'day' or 'week'")
 
     week_raw = request.args.get("week", "0").strip()
     try:
@@ -746,18 +923,18 @@ def parse_availability_args() -> tuple[list[str], list[str], str, str, str, str,
     if week < 0:
         raise ValueError("Query parameter 'week' must be >= 0")
 
-    date_raw = request.args.get("date", "").strip()
-    target_date = parse_client_date(date_raw) if date_raw else datetime.now().strftime("%d.%m.%Y")
-
     slot = current_lesson_slot()
     start_time = request.args.get("start", "").strip() or slot["start"]
     end_time = request.args.get("end", "").strip() or slot["end"]
-    start_minutes = parse_minutes(start_time)
-    end_minutes = parse_minutes(end_time)
-    if start_minutes >= end_minutes:
-        raise ValueError("Start time must be earlier than end time")
+    intervals = parse_interval_values(request.args.get("slots"), start_time, end_time)
+    if view == "week":
+        target_days = week_dates(week)
+    else:
+        date_raw = request.args.get("date", "").strip()
+        target_date = parse_client_date(date_raw) if date_raw else datetime.now().strftime("%d.%m.%Y")
+        target_days = [{"date": target_date, "day_label": ""}]
 
-    return classrooms, groups, mode, target_date, start_time, end_time, start_minutes, end_minutes
+    return classrooms, groups, mode, view, week, target_days, intervals
 
 
 @app.get("/")
@@ -810,6 +987,59 @@ def get_schedule() -> Any:
         return jsonify({"error": "Unexpected parser error", "reason": str(error)}), 500
 
 
+@app.get("/api/classrooms")
+def get_classroom_options() -> Any:
+    query = request.args.get("q", "").strip()
+    limit_raw = request.args.get("limit", "20").strip()
+    try:
+        limit = max(1, min(int(limit_raw), 50))
+    except ValueError:
+        return jsonify({"error": "Query parameter 'limit' must be an integer"}), 400
+
+    try:
+        classrooms = cached_classrooms()
+    except HTTPError as error:
+        return jsonify({"error": "Schedule source returned an error", "status": error.code}), 502
+    except URLError as error:
+        return jsonify({"error": "Failed to connect to schedule source", "reason": str(error)}), 502
+    except Exception as error:
+        return jsonify({"error": "Unexpected parser error", "reason": str(error)}), 500
+
+    normalized_query = normalize_lookup(query)
+    if normalized_query:
+        classrooms = [
+            classroom
+            for classroom in classrooms
+            if normalized_query in normalize_lookup(classroom)
+        ]
+
+    return jsonify({"items": classrooms[:limit]})
+
+
+@app.get("/api/groups")
+def get_group_options() -> Any:
+    query = request.args.get("q", "").strip()
+    if len(query) < 1:
+        return jsonify({"items": []})
+
+    limit_raw = request.args.get("limit", "20").strip()
+    try:
+        limit = max(1, min(int(limit_raw), 50))
+    except ValueError:
+        return jsonify({"error": "Query parameter 'limit' must be an integer"}), 400
+
+    try:
+        groups = cached_group_search(query)
+    except HTTPError as error:
+        return jsonify({"error": "Schedule source returned an error", "status": error.code}), 502
+    except URLError as error:
+        return jsonify({"error": "Failed to connect to schedule source", "reason": str(error)}), 502
+    except Exception as error:
+        return jsonify({"error": "Unexpected parser error", "reason": str(error)}), 500
+
+    return jsonify({"items": groups[:limit]})
+
+
 @app.get("/api/free-classrooms")
 def get_free_classrooms() -> Any:
     try:
@@ -817,11 +1047,10 @@ def get_free_classrooms() -> Any:
             classrooms,
             groups,
             mode,
-            target_date,
-            start_time,
-            end_time,
-            start_minutes,
-            end_minutes,
+            view,
+            week,
+            target_days,
+            intervals,
         ) = parse_availability_args()
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
@@ -829,13 +1058,14 @@ def get_free_classrooms() -> Any:
     if mode == "groups" and not groups:
         return jsonify({"error": "Query parameter 'groups' is required in groups mode"}), 400
 
-    week = int(request.args.get("week", "0"))
     requested_classrooms = classrooms
-    busy_by_room: dict[str, list[dict[str, Any]]] = {}
+    busy_by_room: dict[str, dict[str, dict[tuple[str, str], list[dict[str, Any]]]]] = {}
     errors: list[dict[str, str]] = []
     failed_rooms: set[str] = set()
     checked_sources: list[str] = []
     week_info: dict[str, Any] = {}
+    interval_keys = [(item["start_time"], item["end_time"]) for item in intervals]
+    day_items = [(day["date"], day["day_label"]) for day in target_days]
 
     if mode == "rooms":
         try:
@@ -844,7 +1074,13 @@ def get_free_classrooms() -> Any:
             return jsonify({"error": "Failed to load classroom list", "reason": str(error)}), 502
 
         rooms_to_check = resolve_requested_classrooms(requested_classrooms, known_classrooms)
-        busy_by_room = {room: [] for room in rooms_to_check}
+        busy_by_room = {
+            room: {
+                day_date: {interval_key: [] for interval_key in interval_keys}
+                for day_date, _ in day_items
+            }
+            for room in rooms_to_check
+        }
         payloads, fetch_errors = fetch_classroom_schedules_parallel(rooms_to_check, week)
         errors.extend(fetch_errors)
         failed_rooms.update(error["source"] for error in fetch_errors)
@@ -857,14 +1093,58 @@ def get_free_classrooms() -> Any:
                     "week_start_date": payload.get("week_start_date"),
                     "month": payload.get("month"),
                 }
-            busy_by_room[room].extend(
-                find_room_busy_entries(payload, room, target_date, start_minutes, end_minutes)
-            )
+            for day_date, _ in day_items:
+                for interval in intervals:
+                    interval_key = (interval["start_time"], interval["end_time"])
+                    busy_by_room[room][day_date][interval_key].extend(
+                        find_room_busy_entries(
+                            payload,
+                            room,
+                            day_date,
+                            interval["start_minutes"],
+                            interval["end_minutes"],
+                        )
+                    )
 
     if mode == "groups":
-        busy_by_room = {room: [] for room in requested_classrooms}
+        busy_by_room = {
+            room: {
+                day_date: {interval_key: [] for interval_key in interval_keys}
+                for day_date, _ in day_items
+            }
+            for room in requested_classrooms
+        }
         payloads, fetch_errors = fetch_schedules_parallel(groups, week, GROUP_PAGE_URL)
         errors.extend(fetch_errors)
+
+        room_payloads: list[tuple[str, dict[str, Any]]] = []
+        room_fetch_errors: list[dict[str, str]] = []
+        if requested_classrooms:
+            try:
+                resolved_rooms = resolve_requested_classrooms(requested_classrooms, cached_classrooms())
+            except Exception as error:
+                return jsonify({"error": "Failed to load classroom list", "reason": str(error)}), 502
+            room_payloads, room_fetch_errors = fetch_classroom_schedules_parallel(resolved_rooms, week)
+            errors.extend(room_fetch_errors)
+            requested_to_resolved: dict[str, str] = {}
+            for requested_room in requested_classrooms:
+                for resolved_room in resolved_rooms:
+                    if classroom_matches(resolved_room, requested_room):
+                        requested_to_resolved[requested_room] = resolved_room
+                        break
+            for room_error in room_fetch_errors:
+                for requested_room, resolved_room in requested_to_resolved.items():
+                    if resolved_room == room_error["source"]:
+                        failed_rooms.add(requested_room)
+            room_payload_by_requested = {
+                requested_room: next(
+                    (payload for resolved_room, payload in room_payloads if resolved_room == requested_to_resolved.get(requested_room)),
+                    None,
+                )
+                for requested_room in requested_classrooms
+            }
+        else:
+            room_payload_by_requested = {}
 
         for group, payload in payloads:
             checked_sources.append(group)
@@ -874,44 +1154,111 @@ def get_free_classrooms() -> Any:
                     "week_start_date": payload.get("week_start_date"),
                     "month": payload.get("month"),
                 }
-            for event in events_for_date(payload.get("days", []), target_date):
-                if not isinstance(event, dict):
-                    continue
+            for day_date, _ in day_items:
+                for event in events_for_date(payload.get("days", []), day_date):
+                    if not isinstance(event, dict):
+                        continue
 
-                classroom = event.get("classroom")
-                if not isinstance(classroom, str) or not classroom.strip():
-                    continue
+                    classroom = event.get("classroom")
+                    if not isinstance(classroom, str) or not classroom.strip():
+                        continue
 
-                clean_room = " ".join(classroom.split())
-                if requested_classrooms:
-                    matched_rooms = [room for room in requested_classrooms if classroom_matches(clean_room, room)]
-                else:
-                    matched_rooms = [clean_room]
+                    clean_room = " ".join(classroom.split())
+                    if requested_classrooms:
+                        matched_rooms = [room for room in requested_classrooms if classroom_matches(clean_room, room)]
+                    else:
+                        matched_rooms = [clean_room]
 
-                for room in matched_rooms:
-                    busy_by_room.setdefault(room, [])
-                    if event_overlaps(event, start_minutes, end_minutes):
-                        busy_by_room[room].append(build_busy_entry(event, group))
+                    for room in matched_rooms:
+                        room_days = busy_by_room.setdefault(
+                            room,
+                            {
+                                date_value: {interval_key: [] for interval_key in interval_keys}
+                                for date_value, _ in day_items
+                            },
+                        )
+                        room_intervals = room_days[day_date]
+                        for interval in intervals:
+                            if event_overlaps(event, interval["start_minutes"], interval["end_minutes"]):
+                                room_intervals[(interval["start_time"], interval["end_time"])].append(
+                                    build_busy_entry(event, group)
+                                )
 
     rooms_payload: list[dict[str, Any]] = []
     error_by_room = {error["source"]: error["reason"] for error in errors}
     rooms = sorted(busy_by_room.keys(), key=classroom_sort_key)
     for room in rooms:
-        busy_entries = sorted(
-            busy_by_room.get(room, []),
-            key=lambda item: (item.get("start_time") or "", item.get("discipline") or ""),
-        )
-
         if room in failed_rooms:
             status = "error"
         else:
-            status = "busy" if busy_entries else "free"
+            status = "free"
+
+        day_payloads: list[dict[str, Any]] = []
+        for day_date, day_label in day_items:
+            interval_payloads: list[dict[str, Any]] = []
+            for interval in intervals:
+                interval_key = (interval["start_time"], interval["end_time"])
+                busy_entries = sorted(
+                    busy_by_room.get(room, {}).get(day_date, {}).get(interval_key, []),
+                    key=lambda item: (item.get("start_time") or "", item.get("discipline") or ""),
+                )
+                other_busy_entries: list[dict[str, Any]] = []
+
+                if mode == "groups":
+                    room_schedule_payload = room_payload_by_requested.get(room)
+                    if isinstance(room_schedule_payload, dict):
+                        selected_keys = {busy_entry_key(item) for item in busy_entries}
+                        other_busy_entries = [
+                            entry
+                            for entry in find_room_busy_entries(
+                                room_schedule_payload,
+                                room,
+                                day_date,
+                                interval["start_minutes"],
+                                interval["end_minutes"],
+                            )
+                            if busy_entry_key(entry) not in selected_keys
+                        ]
+                        other_busy_entries.sort(
+                            key=lambda item: (item.get("start_time") or "", item.get("discipline") or "")
+                        )
+
+                if room in failed_rooms:
+                    interval_status = "error"
+                else:
+                    if busy_entries:
+                        interval_status = "selected_busy"
+                        status = "busy"
+                    elif other_busy_entries:
+                        interval_status = "other_busy"
+                        status = "busy"
+                    else:
+                        interval_status = "free"
+
+                interval_payloads.append(
+                    {
+                        "start_time": interval["start_time"],
+                        "end_time": interval["end_time"],
+                        "status": interval_status,
+                        "busy": busy_entries,
+                        "other_busy": other_busy_entries,
+                        "error": error_by_room.get(room) if room in failed_rooms else None,
+                    }
+                )
+
+            day_payloads.append(
+                {
+                    "date": day_date,
+                    "day_label": day_label,
+                    "intervals": interval_payloads,
+                }
+            )
 
         rooms_payload.append(
             {
                 "classroom": room,
                 "status": status,
-                "busy": busy_entries,
+                "days": day_payloads,
                 "error": error_by_room.get(room),
             }
         )
@@ -920,9 +1267,16 @@ def get_free_classrooms() -> Any:
         {
             "source": "schedule.siriusuniversity.ru",
             "mode": mode,
-            "date": target_date,
-            "start_time": start_time,
-            "end_time": end_time,
+            "view": view,
+            "days": target_days,
+            "date": target_days[0]["date"] if target_days else "",
+            "intervals": [
+                {
+                    "start_time": interval["start_time"],
+                    "end_time": interval["end_time"],
+                }
+                for interval in intervals
+            ],
             "week_offset": week,
             "checked_sources": checked_sources,
             "errors": errors,
@@ -948,9 +1302,9 @@ INDEX_HTML = """
   <style>
     :root {
       color-scheme: light;
-      --bg: #f6f7f9;
+      --bg: #f4f6f8;
       --panel: #ffffff;
-      --panel-muted: #edf1f5;
+      --panel-muted: #eef2f6;
       --text: #17202a;
       --muted: #66717f;
       --border: #d8dee6;
@@ -959,6 +1313,8 @@ INDEX_HTML = """
       --danger: #ad2f2f;
       --free: #dff4e6;
       --busy: #ffe8df;
+      --chip: #e6eef8;
+      --chip-text: #25435e;
       --shadow: 0 12px 32px rgba(23, 32, 42, 0.08);
     }
 
@@ -1026,8 +1382,8 @@ INDEX_HTML = """
     }
 
     input,
-    textarea,
-    select {
+    select,
+    button {
       width: 100%;
       border: 1px solid var(--border);
       border-radius: 8px;
@@ -1037,15 +1393,9 @@ INDEX_HTML = """
       outline: none;
     }
 
-    textarea {
-      min-height: 112px;
-      resize: vertical;
-      line-height: 1.4;
-    }
-
     input:focus,
-    textarea:focus,
-    select:focus {
+    select:focus,
+    button:focus-visible {
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(29, 111, 100, 0.12);
     }
@@ -1094,6 +1444,136 @@ INDEX_HTML = """
       color: var(--muted);
       font-size: 13px;
       line-height: 1.35;
+    }
+
+    .inline-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .picker {
+      position: relative;
+    }
+
+    .picker-surface {
+      min-height: 50px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fff;
+      padding: 8px;
+      cursor: text;
+    }
+
+    .picker.open .picker-surface {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(29, 111, 100, 0.12);
+    }
+
+    .picker-input {
+      flex: 1 1 120px;
+      min-width: 96px;
+      border: 0;
+      padding: 4px 2px;
+      background: transparent;
+      box-shadow: none;
+    }
+
+    .picker-input:focus {
+      box-shadow: none;
+    }
+
+    .picker-input::placeholder {
+      color: #8b96a5;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      max-width: 100%;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: var(--chip);
+      color: var(--chip-text);
+      font-size: 13px;
+      line-height: 1;
+    }
+
+    .chip.toggle {
+      cursor: pointer;
+      border: 0;
+    }
+
+    .chip span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .chip button {
+      width: 20px;
+      height: 20px;
+      min-width: 20px;
+      display: inline-grid;
+      place-items: center;
+      padding: 0;
+      border: 0;
+      border-radius: 999px;
+      background: rgba(37, 67, 94, 0.14);
+      color: inherit;
+      cursor: pointer;
+    }
+
+    .picker-menu {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      right: 0;
+      z-index: 20;
+      display: none;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .picker.open .picker-menu {
+      display: block;
+    }
+
+    .picker-status {
+      padding: 10px 12px 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .picker-options {
+      max-height: 240px;
+      overflow-y: auto;
+      padding: 4px;
+    }
+
+    .picker-option {
+      width: 100%;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      padding: 9px 10px;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .picker-option:hover,
+    .picker-option:focus-visible {
+      background: var(--panel-muted);
+      box-shadow: none;
     }
 
     .current-slot {
@@ -1200,7 +1680,7 @@ INDEX_HTML = """
 
     .room {
       display: grid;
-      grid-template-columns: minmax(120px, 180px) 96px 1fr;
+      grid-template-columns: minmax(140px, 220px) 1fr;
       align-items: start;
       gap: 14px;
       background: var(--panel);
@@ -1236,6 +1716,11 @@ INDEX_HTML = """
       color: #8c351b;
     }
 
+    .badge.other-busy {
+      background: #fff2d8;
+      color: #8a5a00;
+    }
+
     .badge.error {
       background: #fff1c9;
       color: #7a5200;
@@ -1243,9 +1728,46 @@ INDEX_HTML = """
 
     .lessons {
       display: grid;
-      gap: 8px;
+      gap: 12px;
       color: var(--muted);
       line-height: 1.35;
+    }
+
+    .day-block {
+      display: grid;
+      gap: 10px;
+      padding-top: 6px;
+      border-top: 1px solid var(--border);
+    }
+
+    .day-title {
+      font-weight: 750;
+      color: var(--text);
+      font-size: 15px;
+    }
+
+    .interval-block {
+      display: grid;
+      gap: 8px;
+      border-left: 3px solid var(--border);
+      padding-left: 10px;
+    }
+
+    .interval-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .interval-head strong {
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .interval-note {
+      color: var(--muted);
+      font-size: 13px;
     }
 
     .lesson {
@@ -1308,8 +1830,8 @@ INDEX_HTML = """
 
       <form id="availability-form">
         <div class="current-slot">
-          <strong id="slot-title">Текущая пара</strong>
-          <span id="slot-subtitle">Интервал будет выбран автоматически.</span>
+          <strong id="slot-title">Выбранные интервалы</strong>
+          <span id="slot-subtitle">По умолчанию выбрана текущая пара.</span>
         </div>
 
         <div class="field">
@@ -1324,45 +1846,93 @@ INDEX_HTML = """
               <span>Группы</span>
             </label>
           </div>
-          <div class="hint" id="mode-hint">Пустой список означает все аудитории, найденные в расписании групп.</div>
+          <div class="hint" id="mode-hint">Если аудитории не выбраны, будут проверены все найденные аудитории.</div>
         </div>
 
         <div class="field">
-          <label for="classrooms">Аудитории</label>
-          <textarea id="classrooms" name="classrooms" placeholder="Оставьте пустым, чтобы показать все найденные аудитории">{{ default_classrooms }}</textarea>
-          <div class="hint">Можно ограничить результат конкретными аудиториями через запятую или с новой строки.</div>
+          <label for="classroom-input">Аудитории</label>
+          <div class="picker" id="classroom-picker" data-type="classrooms">
+            <div class="picker-surface" data-surface>
+              <div class="picker-chips" data-chips></div>
+              <input id="classroom-input" class="picker-input" type="text" autocomplete="off" placeholder="Начните вводить аудиторию">
+            </div>
+            <div class="picker-menu" data-menu>
+              <div class="picker-status" data-status>Загрузка аудиторий...</div>
+              <div class="picker-options" data-options></div>
+            </div>
+          </div>
+          <input id="classrooms" name="classrooms" type="hidden" value="{{ default_classrooms }}">
+          <div class="hint">Выбранные аудитории добавляются в виде меток. Если список пуст, проверяются все найденные аудитории.</div>
         </div>
 
         <div class="field" id="groups-field">
-          <label for="groups">Группы</label>
-          <textarea id="groups" name="groups" placeholder="Например: БИВТ-24-1&#10;БИВТ-24-2"></textarea>
-          <div class="hint">В режиме групп аудитории считаются занятыми только по указанным группам.</div>
+          <label for="group-input">Группы</label>
+          <div class="picker" id="group-picker" data-type="groups">
+            <div class="picker-surface" data-surface>
+              <div class="picker-chips" data-chips></div>
+              <input id="group-input" class="picker-input" type="text" autocomplete="off" placeholder="Начните вводить группу">
+            </div>
+            <div class="picker-menu" data-menu>
+              <div class="picker-status" data-status>Начните вводить название группы.</div>
+              <div class="picker-options" data-options></div>
+            </div>
+          </div>
+          <input id="groups" name="groups" type="hidden" value="">
+          <div class="hint">В режиме групп занятость считается только по выбранным группам.</div>
         </div>
 
         <div class="two">
           <div class="field">
-            <label for="date">Дата</label>
+            <label for="date">День</label>
             <input id="date" name="date" type="date" required>
+            <div class="hint">По умолчанию показывается сегодняшний день.</div>
           </div>
           <div class="field">
-            <label for="week">Неделя</label>
+            <label for="availability-filter">Показывать</label>
+            <select id="availability-filter" name="availability_filter">
+              <option value="free" selected>Только свободные</option>
+              <option value="all">Все аудитории</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Неделя</label>
+          <div class="inline-row">
+            <button id="enable-week-view" class="chip toggle" type="button">Вся неделя</button>
+            <div id="week-chip" class="chip" hidden>
+              <span id="week-chip-label">Неделя</span>
+              <button id="disable-week-view" type="button" aria-label="Выключить недельный режим">×</button>
+            </div>
+          </div>
+          <div id="week-field" hidden>
             <select id="week" name="week">
               <option value="0">Текущая</option>
               <option value="1">Следующая</option>
               <option value="2">Через 2 недели</option>
               <option value="3">Через 3 недели</option>
             </select>
+            <div class="hint">В недельном режиме проверка идет сразу по ПН-СБ.</div>
           </div>
+          <input id="view" name="view" type="hidden" value="day">
         </div>
 
         <div class="two">
           <div class="field">
-            <label for="start">С</label>
-            <input id="start" name="start" type="time" value="08:00" required>
-          </div>
-          <div class="field">
-            <label for="end">До</label>
-            <input id="end" name="end" type="time" value="21:30" required>
+            <label for="slot-input">Пары</label>
+            <div class="picker" id="slot-picker">
+              <div class="picker-surface" data-surface>
+                <div class="picker-chips" data-chips></div>
+                <input id="slot-input" class="picker-input" type="text" autocomplete="off" placeholder="Выберите одну или несколько пар">
+              </div>
+              <div class="picker-menu" data-menu>
+                <div class="picker-status" data-status>Доступные интервалы пар</div>
+                <div class="picker-options" data-options></div>
+              </div>
+            </div>
+            <input id="slots" name="slots" type="hidden" value="">
+            <input id="start" name="start" type="hidden" value="08:00">
+            <input id="end" name="end" type="hidden" value="21:30">
           </div>
         </div>
 
@@ -1397,8 +1967,21 @@ INDEX_HTML = """
     const submitButton = form.querySelector("button[type='submit']");
     const slotTitle = document.querySelector("#slot-title");
     const slotSubtitle = document.querySelector("#slot-subtitle");
+    const dateInput = document.querySelector("#date");
+    const weekInput = document.querySelector("#week");
+    const viewInput = document.querySelector("#view");
+    const weekField = document.querySelector("#week-field");
+    const weekChip = document.querySelector("#week-chip");
+    const weekChipLabel = document.querySelector("#week-chip-label");
+    const enableWeekViewButton = document.querySelector("#enable-week-view");
+    const disableWeekViewButton = document.querySelector("#disable-week-view");
+    const availabilityFilterInput = document.querySelector("#availability-filter");
     const lessonSlots = {{ lesson_slots_json | safe }};
     const serverCurrentSlot = {{ current_slot | safe }};
+    const defaultClassrooms = {{ default_classrooms_json | safe }};
+    const slotPicker = document.querySelector("#slot-picker");
+    const startInput = document.querySelector("#start");
+    const endInput = document.querySelector("#end");
 
     function formatDateInput(date) {
       const year = date.getFullYear();
@@ -1432,22 +2015,47 @@ INDEX_HTML = """
       return { ...lessonSlots[lessonSlots.length - 1], state: "finished" };
     }
 
-    function applyCurrentSlot() {
-      const slot = lessonSlots.length ? resolveCurrentSlot() : serverCurrentSlot;
-      document.querySelector("#date").value = formatDateInput(new Date());
-      document.querySelector("#start").value = slot.start;
-      document.querySelector("#end").value = slot.end;
+    function pairLabel(index) {
+      return `${index + 1} пара`;
+    }
 
-      const stateText = slot.state === "active"
-        ? "идет сейчас"
-        : slot.state === "upcoming"
-          ? "следующая пара"
-          : "последняя пара на сегодня";
-      slotTitle.textContent = `${slot.start}-${slot.end}`;
-      slotSubtitle.textContent = stateText;
+    function slotValue(slot) {
+      return `${slot.start}-${slot.end}`;
+    }
+
+    function slotDisplay(slot) {
+      const slotIndex = lessonSlots.findIndex((item) => item.start === slot.start && item.end === slot.end);
+      return `${pairLabel(slotIndex)} · ${slot.start}-${slot.end}`;
+    }
+
+    function syncSlotSummary(values) {
+      if (!values.length) {
+        slotTitle.textContent = "Выбранные интервалы";
+        slotSubtitle.textContent = "Выберите хотя бы одну пару.";
+        return;
+      }
+      slotTitle.textContent = values.length === 1 ? "Выбран 1 интервал" : `Выбрано интервалов: ${values.length}`;
+      slotSubtitle.textContent = values.join(", ");
+    }
+
+    function applyCurrentSlot() {
+      dateInput.value = formatDateInput(new Date());
     }
 
     applyCurrentSlot();
+
+    function weekLabel(value) {
+      return weekInput.querySelector(`option[value="${value}"]`)?.textContent || "Неделя";
+    }
+
+    function syncViewMode() {
+      const isWeekView = viewInput.value === "week";
+      weekField.hidden = !isWeekView;
+      weekChip.hidden = !isWeekView;
+      enableWeekViewButton.hidden = isWeekView;
+      dateInput.disabled = isWeekView;
+      weekChipLabel.textContent = weekLabel(weekInput.value);
+    }
 
     function currentMode() {
       return new FormData(form).get("mode");
@@ -1458,11 +2066,24 @@ INDEX_HTML = """
       groupsField.style.display = mode === "groups" ? "grid" : "none";
       modeHint.textContent = mode === "groups"
         ? "Занятость будет вычислена только по расписанию указанных групп."
-        : "Пустой список означает все аудитории, найденные в расписании групп.";
+        : "Если аудитории не выбраны, будут проверены все найденные аудитории.";
     }
 
     form.addEventListener("change", syncMode);
     syncMode();
+    syncViewMode();
+
+    enableWeekViewButton.addEventListener("click", () => {
+      viewInput.value = "week";
+      syncViewMode();
+    });
+
+    disableWeekViewButton.addEventListener("click", () => {
+      viewInput.value = "day";
+      syncViewMode();
+    });
+
+    weekInput.addEventListener("change", syncViewMode);
 
     function text(value) {
       return value == null || value === "" ? "Без названия" : String(value);
@@ -1476,32 +2097,92 @@ INDEX_HTML = """
       name.className = "room-name";
       name.textContent = room.classroom;
 
-      const badge = document.createElement("div");
-      badge.className = `badge ${room.status}`;
-      badge.textContent = room.status === "free" ? "Свободна" : room.status === "busy" ? "Занята" : "Ошибка";
-
       const lessons = document.createElement("div");
       lessons.className = "lessons";
+      const isWeekView = Array.isArray(room.days) && room.days.length > 1;
 
-      if (room.busy.length === 0) {
-        lessons.textContent = room.status === "error"
-          ? (room.error || "Не удалось проверить расписание.")
-          : "На выбранный интервал занятий не найдено.";
-      } else {
-        room.busy.forEach((event) => {
-          const lesson = document.createElement("div");
-          lesson.className = "lesson";
-          const teachers = Array.isArray(event.teachers) && event.teachers.length
-            ? ` · ${event.teachers.join(", ")}`
-            : "";
-          const time = document.createElement("strong");
-          time.textContent = `${text(event.start_time)}-${text(event.end_time)}`;
-          lesson.append(time, ` ${text(event.discipline)}`, document.createElement("br"), `${text(event.group)}${teachers}`);
-          lessons.appendChild(lesson);
+      const roomDays = Array.isArray(room.days) ? room.days : [];
+      roomDays.forEach((day) => {
+        const dayBlock = document.createElement("div");
+        dayBlock.className = "day-block";
+        if (isWeekView) {
+          const dayTitle = document.createElement("div");
+          dayTitle.className = "day-title";
+          dayTitle.textContent = `${day.day_label} · ${day.date}`;
+          dayBlock.appendChild(dayTitle);
+        }
+
+        const dayIntervals = Array.isArray(day.intervals) ? day.intervals : [];
+        dayIntervals.forEach((interval) => {
+          const block = document.createElement("div");
+          block.className = "interval-block";
+
+          const head = document.createElement("div");
+          head.className = "interval-head";
+          const badge = document.createElement("div");
+          const isGroupsMode = currentMode() === "groups";
+          let badgeClass = "free";
+          let badgeText = "Свободно";
+          if (interval.status === "error") {
+            badgeClass = "error";
+            badgeText = "Ошибка";
+          } else if (interval.status === "selected_busy") {
+            badgeClass = "busy";
+            badgeText = isGroupsMode ? "Занята выбранной группой" : "Занята";
+          } else if (interval.status === "other_busy") {
+            badgeClass = "other-busy";
+            badgeText = "Занята другой группой";
+          } else if (interval.status === "busy") {
+            badgeClass = "busy";
+            badgeText = "Занята";
+          }
+          badge.className = `badge ${badgeClass}`;
+          badge.textContent = badgeText;
+          const intervalTitle = document.createElement("strong");
+          intervalTitle.textContent = `${interval.start_time}-${interval.end_time}`;
+          head.append(badge, intervalTitle);
+          block.appendChild(head);
+
+          const selectedBusy = Array.isArray(interval.busy) ? interval.busy : [];
+          const otherBusy = Array.isArray(interval.other_busy) ? interval.other_busy : [];
+
+          if (selectedBusy.length === 0 && otherBusy.length === 0) {
+            const note = document.createElement("div");
+            note.className = "interval-note";
+            note.textContent = interval.status === "error"
+              ? (interval.error || room.error || "Не удалось проверить расписание.")
+              : currentMode() === "groups"
+                ? "Выбранные группы и другие занятия в этой аудитории на этот интервал не найдены."
+                : "На этот интервал занятий не найдено.";
+            block.appendChild(note);
+          } else {
+            selectedBusy.forEach((event) => {
+              const lesson = document.createElement("div");
+              lesson.className = "lesson";
+              const teachers = Array.isArray(event.teachers) && event.teachers.length
+                ? ` · ${event.teachers.join(", ")}`
+                : "";
+              const discipline = document.createElement("strong");
+              discipline.textContent = text(event.discipline);
+              lesson.append(discipline, document.createElement("br"), `${text(event.group)}${teachers}`);
+              block.appendChild(lesson);
+            });
+
+            if (otherBusy.length) {
+              const note = document.createElement("div");
+              note.className = "interval-note";
+              note.textContent = "Аудитория занята другой группой.";
+              block.appendChild(note);
+            }
+          }
+
+          dayBlock.appendChild(block);
         });
-      }
 
-      row.append(name, badge, lessons);
+        lessons.appendChild(dayBlock);
+      });
+
+      row.append(name, lessons);
       return row;
     }
 
@@ -1511,8 +2192,278 @@ INDEX_HTML = """
       notice.textContent = message;
     }
 
+    function serializeValues(values) {
+      return values.join("\\n");
+    }
+
+    function debounce(fn, delay = 250) {
+      let timeoutId = null;
+      return (...args) => {
+        window.clearTimeout(timeoutId);
+        timeoutId = window.setTimeout(() => fn(...args), delay);
+      };
+    }
+
+    function closePicker(picker) {
+      picker.classList.remove("open");
+    }
+
+    function closeAllPickers(except = null) {
+      document.querySelectorAll(".picker.open").forEach((picker) => {
+        if (picker !== except) {
+          closePicker(picker);
+        }
+      });
+    }
+
+    function createMultiSelectPicker(config) {
+      const root = document.querySelector(config.root);
+      const surface = root.querySelector("[data-surface]");
+      const input = root.querySelector(".picker-input");
+      const menu = root.querySelector("[data-menu]");
+      const status = root.querySelector("[data-status]");
+      const options = root.querySelector("[data-options]");
+      const chips = root.querySelector("[data-chips]");
+      const hiddenInput = document.querySelector(config.hiddenInput);
+      const state = {
+        values: [...(config.initialValues || [])],
+        items: [],
+        loading: false,
+        query: "",
+      };
+
+      function syncHiddenInput() {
+        hiddenInput.value = serializeValues(state.values);
+      }
+
+      function renderChips() {
+        chips.innerHTML = "";
+        state.values.forEach((value) => {
+          const chip = document.createElement("div");
+          chip.className = "chip";
+          const displayValue = typeof config.displayValue === "function" ? config.displayValue(value) : value;
+          chip.innerHTML = `<span>${displayValue}</span>`;
+          const remove = document.createElement("button");
+          remove.type = "button";
+          remove.setAttribute("aria-label", `Убрать ${value}`);
+          remove.textContent = "×";
+          remove.addEventListener("click", (event) => {
+            event.stopPropagation();
+            state.values = state.values.filter((item) => item !== value);
+            renderChips();
+            renderOptions();
+            syncHiddenInput();
+            if (typeof config.onChange === "function") {
+              config.onChange([...state.values]);
+            }
+          });
+          chip.appendChild(remove);
+          chips.appendChild(chip);
+        });
+      }
+
+      function renderOptions() {
+        options.innerHTML = "";
+        const availableItems = state.items.filter((item) => !state.values.includes(item));
+
+        if (state.loading) {
+          status.textContent = "Загрузка...";
+          return;
+        }
+
+        if (!availableItems.length) {
+          status.textContent = state.query
+            ? "Ничего не найдено."
+            : config.emptyPrompt;
+          return;
+        }
+
+        status.textContent = config.caption;
+        availableItems.forEach((item) => {
+          const option = document.createElement("button");
+          option.type = "button";
+          option.className = "picker-option";
+          option.textContent = typeof config.displayValue === "function" ? config.displayValue(item) : item;
+          option.addEventListener("click", () => {
+            state.values.push(item);
+            state.query = "";
+            input.value = "";
+            renderChips();
+            renderOptions();
+            syncHiddenInput();
+            if (typeof config.onChange === "function") {
+              config.onChange([...state.values]);
+            }
+            if (config.keepOpen) {
+              input.focus();
+            } else {
+              closePicker(root);
+            }
+          });
+          options.appendChild(option);
+        });
+      }
+
+      async function loadOptions(query) {
+        if (Array.isArray(config.staticItems)) {
+          const normalizedQuery = normalizeSearch(query);
+          state.items = config.staticItems.filter((item) => {
+            if (!normalizedQuery) {
+              return true;
+            }
+            const displayValue = typeof config.displayValue === "function" ? config.displayValue(item) : item;
+            return normalizeSearch(displayValue).includes(normalizedQuery);
+          });
+          state.loading = false;
+          renderOptions();
+          return;
+        }
+
+        state.loading = true;
+        state.query = query;
+        renderOptions();
+
+        try {
+          const params = new URLSearchParams();
+          if (query) {
+            params.set("q", query);
+          }
+          params.set("limit", "20");
+          const response = await fetch(`${config.endpoint}?${params.toString()}`);
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload.error || "Не удалось загрузить список.");
+          }
+          state.items = Array.isArray(payload.items) ? payload.items : [];
+        } catch (error) {
+          state.items = [];
+          status.textContent = error.message;
+        } finally {
+          state.loading = false;
+          renderOptions();
+        }
+      }
+
+      const debouncedLoad = debounce((value) => {
+        if (!value && config.requireQuery) {
+          state.items = [];
+          state.loading = false;
+          state.query = "";
+          renderOptions();
+          return;
+        }
+        loadOptions(value);
+      }, 220);
+
+      surface.addEventListener("click", () => {
+        closeAllPickers(root);
+        root.classList.add("open");
+        input.focus();
+        if (!state.items.length && (!config.requireQuery || input.value.trim())) {
+          loadOptions(input.value.trim());
+        } else {
+          renderOptions();
+        }
+      });
+
+      input.addEventListener("input", () => {
+        root.classList.add("open");
+        debouncedLoad(input.value.trim());
+      });
+
+      input.addEventListener("focus", () => {
+        closeAllPickers(root);
+        root.classList.add("open");
+        if (!state.items.length && Array.isArray(config.staticItems)) {
+          loadOptions(input.value.trim());
+        } else {
+          renderOptions();
+        }
+      });
+
+      root.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          closePicker(root);
+          input.blur();
+        }
+      });
+
+      state.values = Array.from(new Set(state.values.filter(Boolean)));
+      state.items = Array.isArray(config.staticItems) ? [...config.staticItems] : state.items;
+      renderChips();
+      renderOptions();
+      syncHiddenInput();
+      if (typeof config.onChange === "function") {
+        config.onChange([...state.values]);
+      }
+    }
+
+    function normalizeSearch(value) {
+      return String(value || "").trim().toLowerCase();
+    }
+
+    createMultiSelectPicker({
+      root: "#classroom-picker",
+      hiddenInput: "#classrooms",
+      endpoint: "/api/classrooms",
+      caption: "Выберите аудиторию",
+      emptyPrompt: "Введите название аудитории или оставьте поле пустым для всех аудиторий.",
+      requireQuery: false,
+      keepOpen: true,
+      initialValues: defaultClassrooms,
+    });
+
+    createMultiSelectPicker({
+      root: "#group-picker",
+      hiddenInput: "#groups",
+      endpoint: "/api/groups",
+      caption: "Выберите группу",
+      emptyPrompt: "Начните вводить название группы.",
+      requireQuery: true,
+      keepOpen: true,
+      initialValues: [],
+    });
+
+    const defaultSlot = lessonSlots.length ? resolveCurrentSlot() : serverCurrentSlot;
+    createMultiSelectPicker({
+      root: "#slot-picker",
+      hiddenInput: "#slots",
+      endpoint: "",
+      caption: "Выберите пары",
+      emptyPrompt: "Выберите одну или несколько пар.",
+      requireQuery: false,
+      keepOpen: true,
+      initialValues: [slotValue(defaultSlot)],
+      staticItems: lessonSlots.map((slot) => slotValue(slot)),
+      displayValue: (value) => {
+        const [start, end] = value.split("-");
+        return slotDisplay({ start, end });
+      },
+      onChange: (values) => {
+        syncSlotSummary(values);
+        if (values.length) {
+          const [start, end] = values[0].split("-");
+          startInput.value = start;
+          endInput.value = end;
+        } else {
+          startInput.value = "";
+          endInput.value = "";
+        }
+      },
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest(".picker")) {
+        closeAllPickers();
+      }
+    });
+
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (!document.querySelector("#slots").value.trim()) {
+        setNotice("Выберите хотя бы одну пару.", true);
+        return;
+      }
       submitButton.disabled = true;
       submitButton.textContent = "Проверяю...";
       results.innerHTML = "";
@@ -1530,21 +2481,39 @@ INDEX_HTML = """
           return;
         }
 
-        document.querySelector("#metric-free").textContent = payload.summary.free;
-        document.querySelector("#metric-busy").textContent = payload.summary.busy;
-        document.querySelector("#metric-total").textContent = payload.summary.total;
-        document.querySelector("#metric-errors").textContent = payload.summary.errors;
+        const filterMode = availabilityFilterInput.value;
+        let visibleRooms = Array.isArray(payload.rooms) ? [...payload.rooms] : [];
+        if (filterMode === "free") {
+          visibleRooms = visibleRooms.filter((room) => room.status === "free");
+        }
+        document.querySelector("#metric-free").textContent = visibleRooms.filter((room) => room.status === "free").length;
+        document.querySelector("#metric-busy").textContent = visibleRooms.filter((room) => room.status === "busy").length;
+        document.querySelector("#metric-total").textContent = visibleRooms.length;
+        document.querySelector("#metric-errors").textContent = visibleRooms.filter((room) => room.status === "error").length;
         summary.hidden = false;
 
         const weekText = payload.week && payload.week.week_start_date
-          ? ` Неделя от ${payload.week.week_start_date}.`
+          ? ` Неделя: ${payload.week.week_start_date}.`
+          : "";
+        const intervalsText = Array.isArray(payload.intervals) && payload.intervals.length
+          ? ` Интервалы: ${payload.intervals.map((item) => `${item.start_time}-${item.end_time}`).join(", ")}.`
+          : "";
+        const daysText = Array.isArray(payload.days) && payload.days.length > 1
+          ? ` Дни: ${payload.days[0].date} - ${payload.days[payload.days.length - 1].date}.`
+          : Array.isArray(payload.days) && payload.days.length === 1
+            ? ` День: ${payload.days[0].date}.`
           : "";
         const errorText = payload.errors.length
           ? ` Не удалось проверить: ${payload.errors.map((item) => item.source).join(", ")}.`
           : "";
-        setNotice(`${payload.date}, ${payload.start_time}-${payload.end_time}. Проверено ${payload.summary.total}: свободно ${payload.summary.free}, занято ${payload.summary.busy}.${weekText}${errorText}`);
+        setNotice(`${daysText}${intervalsText} Показано ${visibleRooms.length}.${weekText}${errorText}`);
 
-        payload.rooms
+        if (!visibleRooms.length) {
+          results.innerHTML = `<div class="empty">${filterMode === "free" ? "По выбранным параметрам свободные аудитории не найдены." : "По выбранным параметрам аудитории не найдены."}</div>`;
+          return;
+        }
+
+        visibleRooms
           .sort((a, b) => a.status.localeCompare(b.status) || a.classroom.localeCompare(b.classroom, "ru"))
           .forEach((room) => results.appendChild(renderRoom(room)));
       } catch (error) {
