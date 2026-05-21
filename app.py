@@ -2657,65 +2657,6 @@ INDEX_HTML = """
 </html>
 """
 
-@app.get("/api/debug/connectivity")
-def debug_connectivity() -> Any:
-    import socket
-    results = {}
-    
-    # 1. Проверка DNS резолвинга
-    try:
-        ip = socket.gethostbyname("schedule.siriusuniversity.ru")
-        results["dns"] = {"status": "ok", "ip": ip}
-    except Exception as error:
-        results["dns"] = {"status": "error", "reason": str(error)}
-    
-    # 2. Проверка TCP соединения
-    try:
-        sock = socket.create_connection(("schedule.siriusuniversity.ru", 443), timeout=5)
-        sock.close()
-        results["tcp"] = {"status": "ok"}
-    except Exception as error:
-        results["tcp"] = {"status": "error", "reason": str(error)}
-    
-    # 3. Простой HTTP GET запрос
-    try:
-        from urllib.request import urlopen
-        from urllib.error import HTTPError, URLError
-        with urlopen("https://schedule.siriusuniversity.ru/", timeout=8) as response:
-            results["http"] = {
-                "status": "ok",
-                "code": response.status,
-                "content_length": len(response.read()),
-            }
-    except HTTPError as error:
-        results["http"] = {"status": "http_error", "code": error.code, "reason": str(error.reason)}
-    except URLError as error:
-        results["http"] = {"status": "url_error", "reason": str(error.reason)}
-    except Exception as error:
-        results["http"] = {"status": "error", "reason": str(error)}
-    
-    # 4. Проверка classroom эндпоинта
-    try:
-        from urllib.request import urlopen
-        with urlopen("https://schedule.siriusuniversity.ru/classroom", timeout=8) as response:
-            results["classroom_page"] = {
-                "status": "ok",
-                "code": response.status,
-            }
-    except HTTPError as error:
-        results["classroom_page"] = {"status": "http_error", "code": error.code}
-    except Exception as error:
-        results["classroom_page"] = {"status": "error", "reason": str(error)}
-
-    # 5. Vercel окружение
-    import os
-    results["env"] = {
-        "vercel": os.environ.get("VERCEL", "not set"),
-        "region": os.environ.get("VERCEL_REGION", "not set"),
-        "runtime": os.environ.get("AWS_REGION", "not set"),
-    }
-    
-    return jsonify(results)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
