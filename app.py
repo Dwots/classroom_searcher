@@ -24,6 +24,42 @@ CACHE_TTL_SECONDS = 600
 DEFAULT_DAY_START = "08:00"
 DEFAULT_DAY_END = "21:30"
 DEFAULT_CLASSROOMS: tuple[str, ...] = ()
+BASIC_CLASSROOMS: tuple[str, ...] = (
+    "1.35К_0",
+    "1,34К_1",
+    "1.33К_2",
+    "1.32К_3",
+    "1,31К_4",
+    "1.3К_5",
+    "1,29К_6",
+    "1,28К_7",
+    "1,27К_8",
+    "1,26К_9",
+    "1.25К_10",
+    "1.24К_11",
+    "20-1К_20",
+    "19-3К_19",
+    "2.25К_25",
+    "Альфа 5.1Альфа 5.1 (Основной)",
+    "Альфа 5.2Альфа 5.2 (Основной)",
+    "Альфа 5.3Альфа 5.3 (Основной)",
+    "Альфа 5.4Альфа 5.4 (Основной)",
+    "Альфа 5.5Альфа 5.5 (Основной)",
+    "Альфа 5.6",
+    "Альфа 5.7Альфа 5.7 (Основной)",
+    "Альфа 5.8Альфа 5.8 (Основной)",
+    "Альфа 5.9",
+    "Альфа 5.10Альфа 5.10 (Основной)",
+    "Альфа 5.11Альфа 5.11 (Основной)",
+    "1-14-19.Альфа 4.1 (Основной)",
+    "1-14-18.Альфа 4.2 (Основной)",
+    "1-14-17.Альфа 4.3 (Основной)",
+    "Полигоны EGO",
+    "круглый красный",
+    "1.161.16 К_Газпром нефть (Основной)",
+    "1.081.08 К_Росатом (СПД) (Основной)",
+    "1-07-12.Бета 4.1 (комп) (Основной)",
+)
 LESSON_SLOTS = (
     ("08:45", "10:05"),
     ("10:20", "11:40"),
@@ -944,6 +980,7 @@ def index() -> str:
         INDEX_HTML,
         default_classrooms="\n".join(DEFAULT_CLASSROOMS),
         default_classrooms_json=json.dumps(list(DEFAULT_CLASSROOMS), ensure_ascii=False),
+        basic_classrooms_json=json.dumps(list(BASIC_CLASSROOMS), ensure_ascii=False),
         lesson_slots_json=json.dumps(
             [{"start": start, "end": end} for start, end in LESSON_SLOTS],
             ensure_ascii=False,
@@ -1406,6 +1443,13 @@ INDEX_HTML = """
       gap: 12px;
     }
 
+    .date-filter-row {
+      grid-template-columns: minmax(132px, 0.85fr) minmax(178px, 1.15fr);
+      align-items: start;
+      column-gap: 18px;
+      margin-bottom: 6px;
+    }
+
     .mode {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -1470,6 +1514,36 @@ INDEX_HTML = """
       cursor: text;
     }
 
+    .picker.collapsed .picker-surface {
+      max-height: 72px;
+      overflow: hidden;
+    }
+
+    .picker-tools {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .ghost-button {
+      width: auto;
+      border: 1px solid var(--border);
+      background: #fff;
+      color: var(--muted);
+      padding: 7px 10px;
+      border-radius: 999px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .ghost-button:hover,
+    .ghost-button:focus-visible {
+      color: var(--text);
+      background: var(--panel-muted);
+      box-shadow: none;
+    }
+
     .picker.open .picker-surface {
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(29, 111, 100, 0.12);
@@ -1508,6 +1582,11 @@ INDEX_HTML = """
     .chip.toggle {
       cursor: pointer;
       border: 0;
+    }
+
+    .chip.toggle[aria-pressed="true"] {
+      background: var(--accent);
+      color: #fff;
     }
 
     .chip span {
@@ -1851,7 +1930,11 @@ INDEX_HTML = """
 
         <div class="field">
           <label for="classroom-input">Аудитории</label>
-          <div class="picker" id="classroom-picker" data-type="classrooms">
+          <div class="picker-tools">
+            <button id="basic-classrooms-toggle" class="chip toggle" type="button" aria-pressed="true">Базовый пул</button>
+            <button id="collapse-classrooms-toggle" class="ghost-button" type="button" aria-expanded="false">Развернуть</button>
+          </div>
+          <div class="picker collapsed" id="classroom-picker" data-type="classrooms">
             <div class="picker-surface" data-surface>
               <div class="picker-chips" data-chips></div>
               <input id="classroom-input" class="picker-input" type="text" autocomplete="off" placeholder="Начните вводить аудиторию">
@@ -1862,7 +1945,7 @@ INDEX_HTML = """
             </div>
           </div>
           <input id="classrooms" name="classrooms" type="hidden" value="{{ default_classrooms }}">
-          <div class="hint">Выбранные аудитории добавляются в виде меток. Если список пуст, проверяются все найденные аудитории.</div>
+          <div class="hint">Базовый пул включен при открытии. Его можно выключить и выбрать аудитории вручную.</div>
         </div>
 
         <div class="field" id="groups-field">
@@ -1881,11 +1964,10 @@ INDEX_HTML = """
           <div class="hint">В режиме групп занятость считается только по выбранным группам.</div>
         </div>
 
-        <div class="two">
+        <div class="two date-filter-row">
           <div class="field">
             <label for="date">День</label>
             <input id="date" name="date" type="date" required>
-            <div class="hint">По умолчанию показывается сегодняшний день.</div>
           </div>
           <div class="field">
             <label for="availability-filter">Показывать</label>
@@ -1895,26 +1977,20 @@ INDEX_HTML = """
             </select>
           </div>
         </div>
+        <div class="hint">По умолчанию показывается сегодняшний день и только свободные аудитории.</div>
 
         <div class="field">
-          <label>Неделя</label>
-          <div class="inline-row">
-            <button id="enable-week-view" class="chip toggle" type="button">Вся неделя</button>
-            <div id="week-chip" class="chip" hidden>
-              <span id="week-chip-label">Неделя</span>
-              <button id="disable-week-view" type="button" aria-label="Выключить недельный режим">×</button>
-            </div>
-          </div>
-          <div id="week-field" hidden>
-            <select id="week" name="week">
-              <option value="0">Текущая</option>
-              <option value="1">Следующая</option>
-              <option value="2">Через 2 недели</option>
-              <option value="3">Через 3 недели</option>
-            </select>
-            <div class="hint">В недельном режиме проверка идет сразу по ПН-СБ.</div>
-          </div>
+          <label for="period">Период</label>
+          <select id="period">
+            <option value="day" selected>Выбранный день</option>
+            <option value="week:0">Текущая неделя</option>
+            <option value="week:1">Следующая неделя</option>
+            <option value="week:2">Через 2 недели</option>
+            <option value="week:3">Через 3 недели</option>
+          </select>
+          <div class="hint">Дневной режим показывает выбранный день. Недельный режим проверяет ПН-СБ.</div>
           <input id="view" name="view" type="hidden" value="day">
+          <input id="week" name="week" type="hidden" value="0">
         </div>
 
         <div class="two">
@@ -1968,20 +2044,21 @@ INDEX_HTML = """
     const slotTitle = document.querySelector("#slot-title");
     const slotSubtitle = document.querySelector("#slot-subtitle");
     const dateInput = document.querySelector("#date");
+    const periodInput = document.querySelector("#period");
     const weekInput = document.querySelector("#week");
     const viewInput = document.querySelector("#view");
-    const weekField = document.querySelector("#week-field");
-    const weekChip = document.querySelector("#week-chip");
-    const weekChipLabel = document.querySelector("#week-chip-label");
-    const enableWeekViewButton = document.querySelector("#enable-week-view");
-    const disableWeekViewButton = document.querySelector("#disable-week-view");
     const availabilityFilterInput = document.querySelector("#availability-filter");
     const lessonSlots = {{ lesson_slots_json | safe }};
     const serverCurrentSlot = {{ current_slot | safe }};
     const defaultClassrooms = {{ default_classrooms_json | safe }};
+    const basicClassrooms = {{ basic_classrooms_json | safe }};
+    const basicClassroomsToggle = document.querySelector("#basic-classrooms-toggle");
+    const collapseClassroomsToggle = document.querySelector("#collapse-classrooms-toggle");
+    const classroomPicker = document.querySelector("#classroom-picker");
     const slotPicker = document.querySelector("#slot-picker");
     const startInput = document.querySelector("#start");
     const endInput = document.querySelector("#end");
+    let classroomPickerController = null;
 
     function formatDateInput(date) {
       const year = date.getFullYear();
@@ -2044,17 +2121,19 @@ INDEX_HTML = """
 
     applyCurrentSlot();
 
-    function weekLabel(value) {
-      return weekInput.querySelector(`option[value="${value}"]`)?.textContent || "Неделя";
-    }
+    function syncPeriodMode() {
+      const value = periodInput.value;
+      if (value === "day") {
+        viewInput.value = "day";
+        weekInput.value = "0";
+        dateInput.disabled = false;
+        return;
+      }
 
-    function syncViewMode() {
-      const isWeekView = viewInput.value === "week";
-      weekField.hidden = !isWeekView;
-      weekChip.hidden = !isWeekView;
-      enableWeekViewButton.hidden = isWeekView;
-      dateInput.disabled = isWeekView;
-      weekChipLabel.textContent = weekLabel(weekInput.value);
+      const [, weekOffset] = value.split(":");
+      viewInput.value = "week";
+      weekInput.value = weekOffset || "0";
+      dateInput.disabled = true;
     }
 
     function currentMode() {
@@ -2071,19 +2150,8 @@ INDEX_HTML = """
 
     form.addEventListener("change", syncMode);
     syncMode();
-    syncViewMode();
-
-    enableWeekViewButton.addEventListener("click", () => {
-      viewInput.value = "week";
-      syncViewMode();
-    });
-
-    disableWeekViewButton.addEventListener("click", () => {
-      viewInput.value = "day";
-      syncViewMode();
-    });
-
-    weekInput.addEventListener("change", syncViewMode);
+    syncPeriodMode();
+    periodInput.addEventListener("change", syncPeriodMode);
 
     function text(value) {
       return value == null || value === "" ? "Без названия" : String(value);
@@ -2396,13 +2464,43 @@ INDEX_HTML = """
       if (typeof config.onChange === "function") {
         config.onChange([...state.values]);
       }
+      return {
+        getValues: () => [...state.values],
+        setValues: (values) => {
+          state.values = Array.from(new Set((values || []).filter(Boolean)));
+          renderChips();
+          renderOptions();
+          syncHiddenInput();
+          if (typeof config.onChange === "function") {
+            config.onChange([...state.values]);
+          }
+        },
+        addValues: (values) => {
+          state.values = Array.from(new Set([...state.values, ...(values || []).filter(Boolean)]));
+          renderChips();
+          renderOptions();
+          syncHiddenInput();
+          if (typeof config.onChange === "function") {
+            config.onChange([...state.values]);
+          }
+        },
+        clear: () => {
+          state.values = [];
+          renderChips();
+          renderOptions();
+          syncHiddenInput();
+          if (typeof config.onChange === "function") {
+            config.onChange([]);
+          }
+        },
+      };
     }
 
     function normalizeSearch(value) {
       return String(value || "").trim().toLowerCase();
     }
 
-    createMultiSelectPicker({
+    classroomPickerController = createMultiSelectPicker({
       root: "#classroom-picker",
       hiddenInput: "#classrooms",
       endpoint: "/api/classrooms",
@@ -2410,7 +2508,36 @@ INDEX_HTML = """
       emptyPrompt: "Введите название аудитории или оставьте поле пустым для всех аудиторий.",
       requireQuery: false,
       keepOpen: true,
-      initialValues: defaultClassrooms,
+      initialValues: defaultClassrooms.length ? defaultClassrooms : basicClassrooms,
+      onChange: () => {
+        if (classroomPickerController) {
+          syncBasicClassroomsToggle();
+        }
+      },
+    });
+
+    function syncBasicClassroomsToggle() {
+      const selected = new Set(classroomPickerController.getValues());
+      const enabled = basicClassrooms.length > 0 && basicClassrooms.every((item) => selected.has(item));
+      basicClassroomsToggle.setAttribute("aria-pressed", String(enabled));
+      basicClassroomsToggle.textContent = enabled ? "Базовый пул включен" : "Базовый пул";
+    }
+
+    syncBasicClassroomsToggle();
+    basicClassroomsToggle.addEventListener("click", () => {
+      const enabled = basicClassroomsToggle.getAttribute("aria-pressed") === "true";
+      if (enabled) {
+        classroomPickerController.clear();
+      } else {
+        classroomPickerController.addValues(basicClassrooms);
+      }
+      syncBasicClassroomsToggle();
+    });
+
+    collapseClassroomsToggle.addEventListener("click", () => {
+      const isCollapsed = classroomPicker.classList.toggle("collapsed");
+      collapseClassroomsToggle.setAttribute("aria-expanded", String(!isCollapsed));
+      collapseClassroomsToggle.textContent = isCollapsed ? "Развернуть" : "Свернуть";
     });
 
     createMultiSelectPicker({
